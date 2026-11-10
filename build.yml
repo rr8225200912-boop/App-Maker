@@ -1,0 +1,97 @@
+name: Build APK
+run-name: build ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job id
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Accept Android licenses
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Unpack project
+        run: |
+          set -e
+          [[ "$JOB_ID" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "invalid job id"; exit 1; }
+          mkdir -p /tmp/proj
+          unzip -q "jobs/$JOB_ID.zip" -d /tmp/proj
+          ROOT=$(find /tmp/proj \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) -not -path '*/node_modules/*' | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2- | xargs -r dirname)
+          if [ -z "$ROOT" ]; then
+            echo "ERROR: settings.gradle not found - this is not a Gradle Android project"
+            exit 1
+          fi
+          echo "Project root: $ROOT"
+          echo "PROJECT_ROOT=$ROOT" >> "$GITHUB_ENV"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build APK
+        run: |
+          set -e
+          cd "$PROJECT_ROOT"
+          rm -f local.properties
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            GR=./gradlew
+          else
+            echo "gradlew not found, using Gradle 8.9"
+            GR=gradle
+          fi
+          $GR assembleRelease --no-daemon --stacktrace --console=plain
+
+      - name: Sign APK
+        run: |
+          set -e
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          BTP="$ANDROID_HOME/build-tools/$BT"
+          source "$GITHUB_WORKSPACE/keystore/keystore.properties"
+          base64 -d "$GITHUB_WORKSPACE/keystore/release.jks.b64" > /tmp/release.jks
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          FOUND=0
+          while IFS= read -r f; do
+            FOUND=1
+            name=$(basename "$f" .apk | sed 's/-unsigned//')
+            "$BTP/zipalign" -f -p 4 "$f" /tmp/aligned.apk
+            "$BTP/apksigner" sign --ks /tmp/release.jks --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS" --out "$GITHUB_WORKSPACE/out/$name-signed.apk" /tmp/aligned.apk
+            "$BTP/apksigner" verify "$GITHUB_WORKSPACE/out/$name-signed.apk"
+            echo "Signed: $name-signed.apk"
+          done < <(find "$PROJECT_ROOT" -path '*/build/outputs/apk/*' -name '*.apk' -not -path '*androidTest*' | grep -i release || true)
+          if [ "$FOUND" = "0" ]; then
+            echo "ERROR: no release APK found after build"
+            exit 1
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
